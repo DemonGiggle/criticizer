@@ -72,7 +72,16 @@ class WorkQueueStore:
         self.conn.commit()
         return int(cur.lastrowid)
 
-    def claim_next(self, worker_id: str, lease_duration_seconds: int = 30) -> sqlite3.Row | None:
+    def claim_next(
+        self,
+        worker_id: str,
+        lease_duration_seconds: int = 30,
+        *,
+        max_active_running: int | None = None,
+    ) -> sqlite3.Row | None:
+        if max_active_running is not None and max_active_running < 0:
+            raise ValueError("max_active_running must be >= 0")
+
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             self.conn.execute(
@@ -89,11 +98,19 @@ class WorkQueueStore:
             )
             row = self.conn.execute(
                 """
-                WITH candidate AS (
+                WITH active_capacity AS (
+                    SELECT COUNT(*) AS active_running
+                    FROM work_queue
+                    WHERE status = 'running'
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at > now()
+                ),
+                candidate AS (
                     SELECT id
                     FROM work_queue
                     WHERE status = 'queued'
                       AND run_at <= now()
+                      AND (? IS NULL OR (SELECT active_running FROM active_capacity) < ?)
                     ORDER BY priority DESC, created_at ASC
                     LIMIT 1
                 )
@@ -106,7 +123,7 @@ class WorkQueueStore:
                 WHERE id = (SELECT id FROM candidate)
                 RETURNING *
                 """,
-                (worker_id, lease_duration_seconds),
+                (max_active_running, max_active_running, worker_id, lease_duration_seconds),
             ).fetchone()
             self.conn.commit()
             return row
