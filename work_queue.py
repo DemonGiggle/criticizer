@@ -75,6 +75,18 @@ class WorkQueueStore:
     def claim_next(self, worker_id: str, lease_duration_seconds: int = 30) -> sqlite3.Row | None:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
+            self.conn.execute(
+                """
+                UPDATE work_queue
+                SET status = 'queued',
+                    claimed_by = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = now()
+                WHERE status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= now()
+                """
+            )
             row = self.conn.execute(
                 """
                 WITH candidate AS (
@@ -101,6 +113,22 @@ class WorkQueueStore:
         except Exception:
             self.conn.rollback()
             raise
+
+    def requeue_expired_running(self) -> MutationResult:
+        rows = self.conn.execute(
+            """
+            UPDATE work_queue
+            SET status = 'queued',
+                claimed_by = NULL,
+                lease_expires_at = NULL,
+                updated_at = now()
+            WHERE status = 'running'
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at <= now()
+            """
+        ).rowcount
+        self.conn.commit()
+        return MutationResult(ok=True, rows_affected=rows, diagnostics={"code": "ok"})
 
     def claim(self, job_id: int, worker_id: str) -> MutationResult:
         rows = self.conn.execute(
