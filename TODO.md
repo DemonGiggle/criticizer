@@ -5,7 +5,7 @@ This checklist tracks work still needed to fully align implementation with `spec
 ## High priority
 
 - [ ] Expand persistence model from in-memory/local SQLite usage patterns to a deployable DB profile with explicit transactional isolation guidance and migration strategy.
-- [ ] Add end-to-end integration tests that exercise the full flow: ingest -> queue claim -> validation -> outbox delivery -> job finalization.
+- [x] Add end-to-end integration tests that exercise the full flow: ingest -> queue claim -> validation -> outbox delivery -> job finalization.
 - [ ] Add structured observability (metrics + logs + trace correlation IDs) for:
   - queue claims/lease loss
   - finding coercions/drops/rejections
