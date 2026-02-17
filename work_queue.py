@@ -20,6 +20,7 @@ class WorkQueueStore:
 
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
+        self.conn.row_factory = sqlite3.Row
         # Define now() once so every mutation can use DB-side now() in SQL.
         self.conn.create_function("now", 0, lambda: datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
         self._ensure_schema()
@@ -31,8 +32,11 @@ class WorkQueueStore:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 payload TEXT,
                 status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed')),
+                priority INTEGER NOT NULL DEFAULT 0,
+                run_at TEXT NOT NULL DEFAULT (now()),
                 claimed_by TEXT,
                 lease_expires_at TEXT,
+                started_at TEXT,
                 created_at TEXT NOT NULL DEFAULT (now()),
                 updated_at TEXT NOT NULL DEFAULT (now())
             )
@@ -40,16 +44,47 @@ class WorkQueueStore:
         )
         self.conn.commit()
 
-    def enqueue(self, payload: str) -> int:
+    def enqueue(self, payload: str, *, priority: int = 0, run_at: str | None = None) -> int:
+        scheduled_run_at = run_at or self.conn.execute("SELECT now()").fetchone()[0]
         cur = self.conn.execute(
             """
-            INSERT INTO work_queue (payload, status)
-            VALUES (?, 'queued')
+            INSERT INTO work_queue (payload, status, priority, run_at)
+            VALUES (?, 'queued', ?, ?)
             """,
-            (payload,),
+            (payload, priority, scheduled_run_at),
         )
         self.conn.commit()
         return int(cur.lastrowid)
+
+    def claim_next(self, worker_id: str, lease_duration_seconds: int = 30) -> sqlite3.Row | None:
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                """
+                WITH candidate AS (
+                    SELECT id
+                    FROM work_queue
+                    WHERE status = 'queued'
+                      AND run_at <= now()
+                    ORDER BY priority DESC, created_at ASC
+                    LIMIT 1
+                )
+                UPDATE work_queue
+                SET status = 'running',
+                    claimed_by = ?,
+                    lease_expires_at = datetime(now(), '+' || ? || ' seconds'),
+                    started_at = now(),
+                    updated_at = now()
+                WHERE id = (SELECT id FROM candidate)
+                RETURNING *
+                """,
+                (worker_id, lease_duration_seconds),
+            ).fetchone()
+            self.conn.commit()
+            return row
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def claim(self, job_id: int, worker_id: str) -> MutationResult:
         rows = self.conn.execute(
@@ -169,7 +204,6 @@ class WorkQueueStore:
         return row[0] if row else None
 
     def get_job(self, job_id: int) -> sqlite3.Row:
-        self.conn.row_factory = sqlite3.Row
         row = self.conn.execute("SELECT * FROM work_queue WHERE id = ?", (job_id,)).fetchone()
         assert row is not None
         return row
