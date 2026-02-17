@@ -1,15 +1,30 @@
 # Specification
 
-## 4.2 WorkQueue
+This document uses normative language from RFC 2119/8174: **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY**.
+
+## Document guardrails
+
+### Global invariants
+- All state transitions MUST be monotonic and auditable via `updated_at` (or equivalent event log).
+- Any operation that can be retried MUST be safe under at-least-once execution.
+- Ownership-sensitive writes MUST include an owner/lease predicate to prevent stale-worker mutation.
+- Validation and reconciliation MUST emit machine-readable diagnostics for every dropped or coerced field.
+
+### Time and clock assumptions
+- All persisted timestamps MUST be UTC.
+- `now()` references MUST use the database clock (not application host clock) during transactional updates.
+- Implementations SHOULD define an operational skew budget (recommended <= 2 seconds) between app hosts and DB.
+
+## WorkQueue
 
 The WorkQueue stores processable jobs and coordinates safe concurrent worker execution.
 
-### 4.2.1 States and transitions
+### States and transitions
 - Valid states: `queued`, `running`, `completed`, `failed`.
 - A worker may only start work by **atomically** transitioning a single job from `queued` to `running`.
 - `running -> completed|failed` is only valid for the worker that currently owns the lease (`claimed_by`).
 
-### 4.2.2 Lease model
+### Lease model
 Each row includes lease metadata:
 - `claimed_by`: unique worker identifier that currently owns the job lease.
 - `lease_expires_at`: UTC timestamp indicating when ownership expires unless renewed.
@@ -20,19 +35,19 @@ Lease rules:
 - Heartbeat is an update guarded by `id` + `claimed_by` + `status='running'` so only the owner can renew.
 - If heartbeat fails (0 rows updated), the worker must stop processing and treat the lease as lost.
 
-### 4.2.3 Requeue of expired leases
+### Requeue of expired leases
 - Any `running` job with `lease_expires_at <= now()` is considered expired and no longer owned.
 - Requeue operation transitions expired rows to `queued`, clears `claimed_by`, and clears or resets `lease_expires_at`.
 - Requeue may run in a periodic sweeper and/or inline in claim logic.
 - Requeue must be idempotent and safe under concurrency.
 
-### 4.2.4 Crash recovery and worker limits
+### Crash recovery and worker limits
 - If a worker crashes, it stops heartbeating; on lease expiry, the job becomes eligible for requeue and reclaim.
 - Recovery is lease-driven (no manual worker tombstone required for correctness).
 - Max concurrent workers (`W`) limits active claims globally: at most `W` jobs should be in `running` due to new claims at any point in time.
 - Expired `running` rows do not count as active capacity once lease expiry is detected; a sweeper/claim path should requeue promptly so capacity is restored.
 
-### 4.2.5 Claim transaction and isolation guarantees
+### Claim transaction and isolation guarantees
 Claim/update operations require DB semantics that prevent double-claim:
 - Claim must execute in a single transaction.
 - The selected candidate row must be locked (e.g., `FOR UPDATE SKIP LOCKED` in PostgreSQL).
@@ -69,7 +84,7 @@ COMMIT;
 
 If `RETURNING` yields no row, no job was claimed.
 
-## 6. Processing Flow
+## WorkQueue processing flow
 
 1. **Optional lease cleanup**
    - Requeue expired leases (`running` + `lease_expires_at <= now()`) by setting `status='queued'`, `claimed_by=NULL`, `lease_expires_at=NULL`.
@@ -97,15 +112,14 @@ If `RETURNING` yields no row, no job was claimed.
 7. **Concurrency bound interaction**
    - Scheduler/worker pool should not exceed configured max concurrent workers.
    - Capacity accounting should treat only non-expired leases as active; expired leases are reclaimed via requeue before or during claim loops.
-# Review Criticizer Spec
 
-## 5. Output Contract
+## Output contract
 
-### 5.3 ReviewResult
+### ReviewResult
 
 `ReviewResult` is the canonical top-level response object emitted by the reviewer.
 
-#### 5.3.1 Canonical JSON schema
+#### Canonical JSON schema
 
 ```json
 {
@@ -170,7 +184,7 @@ Optional fields:
 - Top level: `summary`, `meta`
 - Per finding: `end_line`, `suggestion`, `confidence`, `rule_id`
 
-#### 5.3.2 Validation behavior
+#### Validation behavior
 
 Validation MUST execute in this order:
 1. Parse JSON.
@@ -191,7 +205,22 @@ Handling invalid values:
 
 Any coercion MUST be logged in parser diagnostics.
 
-#### 5.3.3 File-path reconciliation
+Required parser diagnostics:
+- `coercion_applied`: includes finding `id` when available, field name, old value (redacted if sensitive), new value.
+- `finding_dropped`: includes reason code and stable location metadata (`file`, `line`) when parseable.
+- `response_rejected`: includes top-level reason code when the entire payload is rejected.
+
+Recommended reason codes (non-exhaustive, implementation MAY extend):
+- `invalid_json`
+- `schema_mismatch`
+- `missing_required_field`
+- `invalid_enum_value`
+- `invalid_line_range`
+- `file_not_in_changed_files`
+- `incompatible_version`
+- `all_findings_dropped`
+
+#### File-path reconciliation
 
 Each finding `file` MUST reconcile with the changed files list for the review target:
 - The canonicalized finding path must exactly match one path in `changed_files`, OR
@@ -199,7 +228,7 @@ Each finding `file` MUST reconcile with the changed files list for the review ta
 
 If no match is found, the finding is dropped and a diagnostic reason `file_not_in_changed_files` is emitted.
 
-#### 5.3.4 Partial parse fallback behavior
+#### Partial parse fallback behavior
 
 If a response is partially parseable:
 - Keep all findings that pass full validation + reconciliation.
@@ -208,9 +237,9 @@ If a response is partially parseable:
 - Return a successful `ReviewResult` only if at least one valid finding remains.
 - If zero valid findings remain, return `findings: []` with a top-level warning diagnostic `all_findings_dropped` instead of hard-failing the entire review.
 
-## 7. Prompting Strategy
+## Prompting strategy
 
-### 7.1 Prompt/schema versioning
+### Prompt/schema versioning
 
 Prompts MUST explicitly pin both:
 - `prompt_version`: version of instruction text/behavior contract.
@@ -218,7 +247,7 @@ Prompts MUST explicitly pin both:
 
 Both fields are required in model output and validated before findings are consumed.
 
-### 7.2 Compatibility expectations
+### Compatibility expectations
 
 Compatibility policy:
 - **Patch update** (`x.y.z` for prompt, optional third segment): backward-compatible clarifications only.
@@ -230,7 +259,7 @@ Runtime behavior:
 - Parser accepts exact `prompt_version` by default; can allow configured patch drift within the same major/minor.
 - On incompatible versions, parser rejects the response before finding-level validation and emits `incompatible_version` diagnostics.
 
-### 7.3 Prompt construction rules
+### Prompt construction rules
 
 Prompt templates MUST:
 1. Include current `prompt_version` and required `schema_version` literals.
@@ -238,8 +267,10 @@ Prompt templates MUST:
 3. Instruct the model to emit only findings whose `file` is present in `changed_files`.
 4. Instruct the model that invalid or uncertain findings should be omitted rather than fabricated.
 5. Require strict JSON output with no prose wrappers.
+6. Require deterministic field names and forbid undocumented keys unless explicitly allowed by schema.
+7. Include a short reminder that unknown enum values cause drops/rejection.
 
-### 7.4 Rollout strategy
+### Rollout strategy
 
 When upgrading prompt or schema:
 1. Ship parser support first for new version (read-compat mode).
@@ -247,13 +278,16 @@ When upgrading prompt or schema:
 3. Monitor diagnostics: coercions, dropped findings, and incompatible-version failures.
 4. Promote to full rollout only when dropped-finding rate remains within SLO.
 5. Remove legacy compatibility paths in a subsequent major release.
-# Criticizer Specification
 
-## 9. Security Considerations
+Rollout gates SHOULD include:
+- A canary alarm when `response_rejected` exceeds baseline by more than 2x for 30 minutes.
+- A rollback trigger when valid findings/job drops below agreed SLO threshold.
+
+## Security considerations
 
 This section defines implementation-level security requirements. These requirements are normative and use **MUST**, **SHOULD**, and **MAY** language.
 
-### 9.1 Depot path allow-list policy and `ChangeFetcher` enforcement
+### Depot path allow-list policy and `ChangeFetcher` enforcement
 
 1. The service **MUST** maintain a canonical allow-list of depot path prefixes (for example: `//depot/projectA/...`, `//depot/libs/security/...`).
 2. The allow-list **MUST** be loaded from configuration at startup and validated for:
@@ -269,7 +303,7 @@ This section defines implementation-level security requirements. These requireme
    - A structured security event log is emitted with denied path and reason.
 5. Allow-list changes **MUST** be auditable (who changed, when, and what changed).
 
-### 9.2 Safe subprocess invocation for `p4`
+### Safe subprocess invocation for `p4`
 
 1. `p4` commands **MUST** be executed with argumentized subprocess APIs (e.g., `execve`/`subprocess.run([...], shell=False)`).
 2. Shell interpolation is prohibited:
@@ -281,7 +315,7 @@ This section defines implementation-level security requirements. These requireme
    - Apply explicit timeouts and non-zero exit handling.
 4. Logs for command execution **MUST** include sanitized argument metadata only (never raw secrets or untrusted payloads).
 
-### 9.3 Secret handling for SMTP and LLM credentials
+### Secret handling for SMTP and LLM credentials
 
 1. SMTP and LLM credentials **MUST** come from approved secret sources only:
    - Environment variables injected by runtime secret managers, or
@@ -296,11 +330,11 @@ This section defines implementation-level security requirements. These requireme
    - Emergency rotation **MUST** be supported for suspected compromise.
    - Rollout **SHOULD** support dual-key overlap to avoid downtime.
 
-### 9.4 Artifact retention and access controls
+### Artifact retention and access controls
 
 1. Review artifacts (diff snapshots, prompt payloads, model responses, email payload metadata) **MUST** have explicit retention TTLs:
-   - Raw artifacts containing sensitive content: default TTL ≤ 7 days.
-   - Redacted artifacts used for analytics/debugging: default TTL ≤ 30 days.
+   - Raw artifacts containing sensitive content: default TTL <= 7 days.
+   - Redacted artifacts used for analytics/debugging: default TTL <= 30 days.
 2. Stored artifacts **MUST** be encrypted at rest using platform-managed encryption keys at minimum; customer-managed keys are recommended where available.
 3. Access control requirements:
    - Least-privilege RBAC for read/write/delete operations.
@@ -311,7 +345,7 @@ This section defines implementation-level security requirements. These requireme
    - LLM-bound data paths **MUST** reference redacted artifacts only.
 5. TTL enforcement **MUST** include automatic deletion jobs and periodic verification.
 
-### 9.5 Redaction patterns and required tests before LLM submission
+### Redaction patterns and required tests before LLM submission
 
 1. All content destined for LLM submission **MUST** pass through a deterministic redaction pipeline.
 2. At minimum, the redaction pipeline **MUST** detect and redact:
@@ -328,13 +362,14 @@ This section defines implementation-level security requirements. These requireme
    - Boundary tests for multiline secrets (e.g., PEM) and truncated tokens.
    - Regression tests for previously reported leakage cases.
 5. A pre-submit guard **MUST** block LLM requests when redaction fails, is bypassed, or produces parser errors.
-# Criticizer Processing Specification
 
-## 8. Error Handling
+## Criticizer processing
+
+### Processing error handling
 
 This section defines failure classification, retry behavior, attempt budgeting, dead-letter payload shape, and operator recovery procedures.
 
-### 8.1 Failure Classification
+#### Failure classification
 
 All failures MUST be classified as either **retryable** (automatic retries allowed) or **non-retryable** (fail immediately to dead-letter queue).
 
@@ -350,7 +385,7 @@ All failures MUST be classified as either **retryable** (automatic retries allow
 | Content policy / hard business-rule reject | Moderation block, explicit deny policy | Non-retryable | Escalate for operator review if unexpected. |
 | Configuration/runtime bug | Null dereference, illegal state, invariant violation, bad deploy config | Non-retryable | Dead-letter and page operator; replay only after fix. |
 
-### 8.2 Retry Backoff Policy
+#### Retry backoff policy
 
 For all retryable failures, the system MUST apply the following backoff parameters unless an upstream `Retry-After` value is larger:
 
@@ -365,7 +400,7 @@ Additional requirements:
 2. If `Retry-After` is present, effective delay is `max(calculated_backoff, retry_after)`, capped by an operational ceiling of 5 minutes.
 3. Retries MUST stop immediately when a failure is reclassified to non-retryable.
 
-### 8.3 Attempt Budget Model
+#### Attempt budget model
 
 Attempt budget is **per stage**, not global.
 
@@ -376,7 +411,7 @@ Attempt budget is **per stage**, not global.
 
 Rationale: per-stage budgets isolate flaky dependencies and preserve useful work from completed stages.
 
-### 8.4 Dead-Letter Payload Requirements
+#### Dead-letter payload requirements
 
 When processing is dead-lettered, payload MUST include at minimum:
 
@@ -390,7 +425,7 @@ Required safety constraints:
 2. Stack traces MUST be redacted if they contain sensitive literals.
 3. Include `first_failure_at`, `last_failure_at`, and `stage` to support replay triage.
 
-### 8.5 Operator Remediation and Replay Workflow
+#### Operator remediation and replay workflow
 
 Operators MUST use the following workflow before replaying dead-letter items:
 
@@ -413,9 +448,10 @@ Operators MUST use the following workflow before replaying dead-letter items:
    - Annotate dead-letter item with resolution notes and close incident.
 
 If replay fails again with the same non-retryable `error_class`, item MUST be re-queued to dead-letter and escalated for engineering review.
-# Review Notification Processing Spec
 
-## 6. Processing Flow
+## Notification delivery
+
+### Processing flow
 
 1. **Job creation and dedupe gate**
    - A new review-processing job MUST be created with a caller-provided `idempotency_key`.
@@ -447,25 +483,25 @@ If replay fails again with the same non-retryable `error_class`, item MUST be re
    - Mark job `succeeded` only when all required recipients for the target `review_version` have delivery rows with `notified_at` set.
    - Otherwise keep job `retryable_failed` or `in_progress` depending on retry policy.
 
-## 8. Error Handling
+### Delivery error handling
 
-### 8.1 General rules
+#### General rules
 - All delivery attempts MUST be recorded in an outbox or delivery log keyed by `(changelist_id, recipient, review_version)`.
 - Transient provider/network failures SHOULD produce retryable states with exponential backoff.
 - Permanent failures (invalid recipient, policy rejection) SHOULD mark recipient delivery row failed and require operator or caller intervention.
 
-### 8.2 Failure matrix
+#### Failure matrix
 
 | Scenario | Immediate state | Recovery action | Duplicate-send risk | Required invariant |
 |---|---|---|---|---|
 | **Email sent but DB write failed** (provider accepted send, then DB update for `notified_at`/`notification_id` failed) | Outbox row still appears unsent or partially updated | On retry, first attempt provider lookup by deterministic key / prior `notification_id`; if found delivered, backfill `notification_id` and `notified_at` without resending | High unless guarded; mitigated by provider idempotency key + lookup-before-resend | Never mark failed permanently until reconciliation attempted |
 | **DB write succeeded but send failed** (DB transaction incorrectly marked sent before provider confirmation, or send call fails after optimistic write) | Inconsistent local state indicates sent but provider has no record | Reconcile by provider lookup; if not delivered, clear sent markers (`notified_at`, `notification_id`) and requeue send; this path SHOULD alert because ordering contract was violated | Medium; depends on correction timing | The canonical contract is send first, then mark; any violation must be detectable and repaired |
 
-### 8.3 Ordering contract enforcement
+#### Ordering contract enforcement
 - The system MUST enforce `send` -> `mark sent` ordering in code review and tests.
 - If implementation detects a row with `notified_at` set but no provider evidence, it MUST transition that row into a reconciliation workflow before any further sends.
 
-## 10. Idempotency
+### Idempotency
 
 1. **Job-level idempotency**
    - `idempotency_key` MUST be unique for job creation requests.
