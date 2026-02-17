@@ -94,6 +94,79 @@ def test_rejects_invalid_json_and_findings_non_array_with_standard_diagnostic_sc
     assert bad_findings.diagnostics[0]["code"] == "schema_mismatch"
 
 
+
+
+def test_rejects_missing_required_top_level_keys():
+    missing_schema = validate_and_reconcile_review_result(
+        json.dumps({"prompt_version": "1.0.0", "findings": []}),
+        changed_files=["src/main.py"],
+        correlation_id="corr-6",
+    )
+    assert missing_schema.rejected is True
+    assert missing_schema.diagnostics[0]["code"] == "missing_required_field"
+    assert missing_schema.diagnostics[0]["details"]["missing"] == ["schema_version"]
+
+
+def test_rejects_top_level_additional_properties():
+    outcome = validate_and_reconcile_review_result(
+        json.dumps({
+            "schema_version": "1.0",
+            "prompt_version": "1.0.0",
+            "findings": [],
+            "unexpected": True,
+        }),
+        changed_files=["src/main.py"],
+        correlation_id="corr-7",
+    )
+
+    assert outcome.rejected is True
+    assert outcome.diagnostics[0]["code"] == "schema_mismatch"
+    assert outcome.diagnostics[0]["reason"] == "additional_properties_not_allowed"
+
+
+def test_rejects_incompatible_or_malformed_contract_versions():
+    malformed_schema = validate_and_reconcile_review_result(
+        json.dumps({"schema_version": "v1", "prompt_version": "1.0.0", "findings": []}),
+        changed_files=["src/main.py"],
+        correlation_id="corr-8",
+    )
+    assert malformed_schema.rejected is True
+    assert malformed_schema.diagnostics[0]["code"] == "schema_mismatch"
+    assert malformed_schema.diagnostics[0]["field"] == "schema_version"
+
+    incompatible_schema = validate_and_reconcile_review_result(
+        json.dumps({"schema_version": "2.0", "prompt_version": "1.0.0", "findings": []}),
+        changed_files=["src/main.py"],
+        correlation_id="corr-9",
+    )
+    assert incompatible_schema.rejected is True
+    assert incompatible_schema.diagnostics[0]["code"] == "incompatible_version"
+    assert incompatible_schema.diagnostics[0]["field"] == "schema_version"
+
+    incompatible_prompt = validate_and_reconcile_review_result(
+        json.dumps({"schema_version": "1.0", "prompt_version": "1.1.0", "findings": []}),
+        changed_files=["src/main.py"],
+        correlation_id="corr-10",
+    )
+    assert incompatible_prompt.rejected is True
+    assert incompatible_prompt.diagnostics[0]["code"] == "incompatible_version"
+    assert incompatible_prompt.diagnostics[0]["field"] == "prompt_version"
+
+
+def test_accepts_backward_compatible_contract_versions():
+    outcome = validate_and_reconcile_review_result(
+        json.dumps({
+            "schema_version": "1.2",
+            "prompt_version": "1.0.9",
+            "findings": [_base_finding()],
+        }),
+        changed_files=["src/main.py"],
+        correlation_id="corr-11",
+    )
+
+    assert outcome.rejected is False
+    assert len(outcome.review_result["findings"]) == 1
+
 def test_recorder_can_be_supplied_for_audit_replay_capture():
     recorder = DiagnosticRecorder()
     payload = {
