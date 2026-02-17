@@ -276,3 +276,63 @@ def test_runtime_stops_immediately_and_emits_event_when_lease_is_lost():
     assert lease_lost_event.type == "lease_lost"
     assert lease_lost_event.payload["status"] == "lease_lost"
     assert lease_lost_event.payload["diagnostics"]["code"] == "not_owner"
+
+
+def test_claim_next_enforces_global_max_active_running_capacity():
+    store = make_store()
+    max_running = 2
+
+    for idx in range(4):
+        store.enqueue(f"job-{idx}", run_at="2000-01-01 00:00:00")
+
+    first = store.claim_next("worker-1", max_active_running=max_running)
+    second = store.claim_next("worker-2", max_active_running=max_running)
+    blocked = store.claim_next("worker-3", max_active_running=max_running)
+
+    assert first is not None
+    assert second is not None
+    assert blocked is None
+
+    active_non_expired = store.conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM work_queue
+        WHERE status = 'running'
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > now()
+        """
+    ).fetchone()[0]
+    assert active_non_expired == max_running
+
+
+def test_claim_next_reclaims_expired_running_before_capacity_check():
+    store = make_store()
+    max_running = 1
+
+    expired = store.enqueue("expired", run_at="2000-01-01 00:00:00")
+    queued = store.enqueue("queued", run_at="2000-01-01 00:00:00")
+
+    claimed = store.claim_next("worker-1", max_active_running=max_running)
+    assert claimed is not None
+    assert claimed["id"] == expired
+
+    store.conn.execute(
+        """
+        UPDATE work_queue
+        SET lease_expires_at = datetime(now(), '-30 seconds')
+        WHERE id = ?
+        """,
+        (expired,),
+    )
+    store.conn.commit()
+
+    next_claim = store.claim_next("worker-2", max_active_running=max_running)
+    assert next_claim is not None
+    assert next_claim["id"] == expired
+
+    reclaimed = store.get_job(expired)
+    assert reclaimed["status"] == "running"
+    assert reclaimed["claimed_by"] == "worker-2"
+
+    still_queued = store.get_job(queued)
+    assert still_queued["status"] == "queued"
