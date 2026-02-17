@@ -21,6 +21,7 @@ It currently focuses on:
 - `notification_outbox.py` — deterministic outbox keys and retry-safe delivery sequencing
 - `failure_pipeline.py` — non-retryable failure routing to dead-letter and replay orchestration
 - `change_ingest.py` — allow-list-enforced changelist fetch + enqueueing
+- `work_queue_sweeper.py` — periodic sweeper CLI/loop for requeuing expired leases
 - `tests/` — unit coverage for all modules above
 
 ## Quick start
@@ -34,6 +35,12 @@ It currently focuses on:
 
 ```bash
 pytest -q
+```
+
+### Run the lease sweeper
+
+```bash
+python -m work_queue_sweeper --db-path /path/to/work_queue.db --interval-seconds 5
 ```
 
 ## Current implementation status
