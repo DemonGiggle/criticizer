@@ -363,11 +363,13 @@ This section defines implementation-level security requirements. These requireme
    - Regression tests for previously reported leakage cases.
 5. A pre-submit guard **MUST** block LLM requests when redaction fails, is bypassed, or produces parser errors.
 
-## Processing error handling
+## Criticizer processing
+
+### Processing error handling
 
 This section defines failure classification, retry behavior, attempt budgeting, dead-letter payload shape, and operator recovery procedures.
 
-### Failure classification
+#### Failure classification
 
 All failures MUST be classified as either **retryable** (automatic retries allowed) or **non-retryable** (fail immediately to dead-letter queue).
 
@@ -383,7 +385,7 @@ All failures MUST be classified as either **retryable** (automatic retries allow
 | Content policy / hard business-rule reject | Moderation block, explicit deny policy | Non-retryable | Escalate for operator review if unexpected. |
 | Configuration/runtime bug | Null dereference, illegal state, invariant violation, bad deploy config | Non-retryable | Dead-letter and page operator; replay only after fix. |
 
-### Retry backoff policy
+#### Retry backoff policy
 
 For all retryable failures, the system MUST apply the following backoff parameters unless an upstream `Retry-After` value is larger:
 
@@ -398,7 +400,7 @@ Additional requirements:
 2. If `Retry-After` is present, effective delay is `max(calculated_backoff, retry_after)`, capped by an operational ceiling of 5 minutes.
 3. Retries MUST stop immediately when a failure is reclassified to non-retryable.
 
-### Attempt budget model
+#### Attempt budget model
 
 Attempt budget is **per stage**, not global.
 
@@ -409,7 +411,7 @@ Attempt budget is **per stage**, not global.
 
 Rationale: per-stage budgets isolate flaky dependencies and preserve useful work from completed stages.
 
-### Dead-letter payload requirements
+#### Dead-letter payload requirements
 
 When processing is dead-lettered, payload MUST include at minimum:
 
@@ -423,7 +425,7 @@ Required safety constraints:
 2. Stack traces MUST be redacted if they contain sensitive literals.
 3. Include `first_failure_at`, `last_failure_at`, and `stage` to support replay triage.
 
-### Operator remediation and replay workflow
+#### Operator remediation and replay workflow
 
 Operators MUST use the following workflow before replaying dead-letter items:
 
@@ -447,7 +449,9 @@ Operators MUST use the following workflow before replaying dead-letter items:
 
 If replay fails again with the same non-retryable `error_class`, item MUST be re-queued to dead-letter and escalated for engineering review.
 
-## Notification processing flow
+## Notification delivery
+
+### Processing flow
 
 1. **Job creation and dedupe gate**
    - A new review-processing job MUST be created with a caller-provided `idempotency_key`.
@@ -479,25 +483,25 @@ If replay fails again with the same non-retryable `error_class`, item MUST be re
    - Mark job `succeeded` only when all required recipients for the target `review_version` have delivery rows with `notified_at` set.
    - Otherwise keep job `retryable_failed` or `in_progress` depending on retry policy.
 
-## Notification error handling
+### Delivery error handling
 
-### General rules
+#### General rules
 - All delivery attempts MUST be recorded in an outbox or delivery log keyed by `(changelist_id, recipient, review_version)`.
 - Transient provider/network failures SHOULD produce retryable states with exponential backoff.
 - Permanent failures (invalid recipient, policy rejection) SHOULD mark recipient delivery row failed and require operator or caller intervention.
 
-### Failure matrix
+#### Failure matrix
 
 | Scenario | Immediate state | Recovery action | Duplicate-send risk | Required invariant |
 |---|---|---|---|---|
 | **Email sent but DB write failed** (provider accepted send, then DB update for `notified_at`/`notification_id` failed) | Outbox row still appears unsent or partially updated | On retry, first attempt provider lookup by deterministic key / prior `notification_id`; if found delivered, backfill `notification_id` and `notified_at` without resending | High unless guarded; mitigated by provider idempotency key + lookup-before-resend | Never mark failed permanently until reconciliation attempted |
 | **DB write succeeded but send failed** (DB transaction incorrectly marked sent before provider confirmation, or send call fails after optimistic write) | Inconsistent local state indicates sent but provider has no record | Reconcile by provider lookup; if not delivered, clear sent markers (`notified_at`, `notification_id`) and requeue send; this path SHOULD alert because ordering contract was violated | Medium; depends on correction timing | The canonical contract is send first, then mark; any violation must be detectable and repaired |
 
-### Ordering contract enforcement
+#### Ordering contract enforcement
 - The system MUST enforce `send` -> `mark sent` ordering in code review and tests.
 - If implementation detects a row with `notified_at` set but no provider evidence, it MUST transition that row into a reconciliation workflow before any further sends.
 
-## Idempotency
+### Idempotency
 
 1. **Job-level idempotency**
    - `idempotency_key` MUST be unique for job creation requests.
