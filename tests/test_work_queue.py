@@ -2,7 +2,7 @@ import sqlite3
 import threading
 import time
 
-from work_queue import WorkQueueStore
+from work_queue import WorkQueueStore, WorkerRuntime
 
 
 def make_store() -> WorkQueueStore:
@@ -130,3 +130,68 @@ def test_claim_next_is_concurrency_safe_for_single_job(tmp_path):
     job = store1.get_job(job_id)
     assert job["status"] == "running"
     assert job["claimed_by"] in {"worker-1", "worker-2"}
+
+
+def test_runtime_periodically_renews_lease_while_processing():
+    store = make_store()
+    job_id = store.enqueue("heartbeat-job")
+    store.claim(job_id, "worker-1")
+
+    clock = {"now": 0.0}
+
+    def now_fn() -> float:
+        return clock["now"]
+
+    runtime = WorkerRuntime(store, "worker-1", now_fn=now_fn)
+
+    steps = {"count": 0}
+
+    def process_step() -> bool:
+        steps["count"] += 1
+        clock["now"] += 1.0
+        return steps["count"] < 5
+
+    result = runtime.process_running_job(job_id, process_step, lease_duration_seconds=3)
+    assert result.status == "processing_complete"
+    assert result.lease_lost is False
+    heartbeat_events = [event for event in result.events if event.type == "heartbeat_renewed"]
+    assert len(heartbeat_events) >= 2
+    assert all(event.payload["status"] == "running" for event in heartbeat_events)
+
+
+def test_runtime_stops_immediately_and_emits_event_when_lease_is_lost():
+    store = make_store()
+    job_id = store.enqueue("lost-lease-job")
+    store.claim(job_id, "owner")
+
+    clock = {"now": 0.0}
+
+    def now_fn() -> float:
+        return clock["now"]
+
+    runtime = WorkerRuntime(store, "owner", now_fn=now_fn)
+
+    steps = {"count": 0}
+
+    def process_step() -> bool:
+        steps["count"] += 1
+        if steps["count"] == 1:
+            store.conn.execute(
+                "UPDATE work_queue SET claimed_by = 'other-worker' WHERE id = ?",
+                (job_id,),
+            )
+            store.conn.commit()
+        clock["now"] += 1.0
+        return True
+
+    result = runtime.process_running_job(job_id, process_step, lease_duration_seconds=3)
+
+    assert result.status == "lease_lost"
+    assert result.lease_lost is True
+    assert runtime.lease_lost is True
+    assert steps["count"] == 1
+    assert len(result.events) == 1
+    lease_lost_event = result.events[0]
+    assert lease_lost_event.type == "lease_lost"
+    assert lease_lost_event.payload["status"] == "lease_lost"
+    assert lease_lost_event.payload["diagnostics"]["code"] == "not_owner"

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 VALID_STATUSES = ("queued", "running", "completed", "failed")
 
@@ -13,6 +14,21 @@ class MutationResult:
     ok: bool
     rows_affected: int
     diagnostics: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class WorkerEvent:
+    type: str
+    job_id: int
+    worker_id: str
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class WorkerRunResult:
+    status: str
+    lease_lost: bool
+    events: list[WorkerEvent]
 
 
 class WorkQueueStore:
@@ -110,15 +126,15 @@ class WorkQueueStore:
             )
         return MutationResult(ok=True, rows_affected=rows, diagnostics={"code": "ok"})
 
-    def heartbeat(self, job_id: int, worker_id: str) -> MutationResult:
+    def heartbeat(self, job_id: int, worker_id: str, lease_duration_seconds: int = 30) -> MutationResult:
         rows = self.conn.execute(
             """
             UPDATE work_queue
-            SET lease_expires_at = datetime(now(), '+30 seconds'),
+            SET lease_expires_at = datetime(now(), '+' || ? || ' seconds'),
                 updated_at = now()
             WHERE id = ? AND claimed_by = ? AND status = 'running'
             """,
-            (job_id, worker_id),
+            (lease_duration_seconds, job_id, worker_id),
         ).rowcount
         self.conn.commit()
         return self._owner_guard_result(rows, job_id, worker_id, action="heartbeat")
@@ -207,3 +223,58 @@ class WorkQueueStore:
         row = self.conn.execute("SELECT * FROM work_queue WHERE id = ?", (job_id,)).fetchone()
         assert row is not None
         return row
+
+
+class WorkerRuntime:
+    """Runs lease-bound processing loops and emits structured events."""
+
+    def __init__(
+        self,
+        store: WorkQueueStore,
+        worker_id: str,
+        *,
+        now_fn: Callable[[], float] | None = None,
+    ):
+        self.store = store
+        self.worker_id = worker_id
+        self.now_fn = now_fn or time.monotonic
+        self.lease_lost = False
+
+    def process_running_job(
+        self,
+        job_id: int,
+        process_step: Callable[[], bool],
+        *,
+        lease_duration_seconds: int = 30,
+    ) -> WorkerRunResult:
+        heartbeat_every = max(1, lease_duration_seconds // 3)
+        next_heartbeat_at = self.now_fn() + heartbeat_every
+        events: list[WorkerEvent] = []
+
+        while True:
+            if self.now_fn() >= next_heartbeat_at:
+                renewal = self.store.heartbeat(job_id, self.worker_id, lease_duration_seconds=lease_duration_seconds)
+                if not renewal.ok:
+                    self.lease_lost = True
+                    events.append(
+                        WorkerEvent(
+                            type="lease_lost",
+                            job_id=job_id,
+                            worker_id=self.worker_id,
+                            payload={"status": "lease_lost", "diagnostics": renewal.diagnostics},
+                        )
+                    )
+                    return WorkerRunResult(status="lease_lost", lease_lost=True, events=events)
+
+                events.append(
+                    WorkerEvent(
+                        type="heartbeat_renewed",
+                        job_id=job_id,
+                        worker_id=self.worker_id,
+                        payload={"status": "running", "lease_duration_seconds": lease_duration_seconds},
+                    )
+                )
+                next_heartbeat_at = self.now_fn() + heartbeat_every
+
+            if not process_step():
+                return WorkerRunResult(status="processing_complete", lease_lost=False, events=events)
