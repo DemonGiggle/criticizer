@@ -14,7 +14,7 @@ It currently focuses on:
 ## Repository layout
 
 - `spec.md` — normative behavior and invariants
-- `work_queue.py` — queue storage + lease claims/heartbeats/finalization + worker runtime helpers
+- `work_queue.py` — queue storage + lease claims/heartbeats/finalization + worker runtime helpers + idle backoff helper
 - `request_validation.py` — parser/validator for model output with coercion + drop diagnostics
 - `reconciliation.py` — canonical repo path normalization and changed-file reconciliation
 - `job_dispatch.py` — job creation, idempotency, and rerun gating by `review_version`
@@ -43,11 +43,29 @@ pytest -q
 python -m work_queue_sweeper --db-path /path/to/work_queue.db --interval-seconds 5
 ```
 
+### Idle worker backoff strategy example
+
+`work_queue.compute_idle_backoff_delay_seconds` provides a spec-aligned full-jitter exponential backoff helper suitable for workers that poll `claim_next` and find no work.
+
+```python
+from work_queue import IdleBackoffPolicy, compute_idle_backoff_delay_seconds
+
+policy = IdleBackoffPolicy(
+    initial_delay_seconds=0.25,
+    multiplier=2.0,
+    max_delay_seconds=5.0,
+    operational_ceiling_seconds=300.0,
+)
+
+# attempt is 1-indexed count of consecutive idle polls
+delay_seconds = compute_idle_backoff_delay_seconds(attempt, policy=policy)
+```
+
 ## Current implementation status
 
 Implemented behaviors include:
 
-- Atomic queue claiming with lease assignment, expiry requeue, owner-guarded heartbeat/finalize, and max-active-running capacity checks.
+- Atomic queue claiming with lease assignment, expiry requeue, owner-guarded heartbeat/finalize, max-active-running capacity checks, and a reusable full-jitter idle backoff helper.
 - `ReviewResult` contract checks including schema/prompt version compatibility, finding-level validation, safe coercions, per-finding drops, and machine-readable diagnostics.
 - Notification dedupe via `(changelist_id, recipient, review_version)` and deterministic provider idempotency keys.
 - Job-level idempotency on `idempotency_key`, plus rerun blocking/allow rules tied to prior succeeded versions.

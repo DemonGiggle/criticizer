@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from random import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -29,6 +30,46 @@ class WorkerRunResult:
     status: str
     lease_lost: bool
     events: list[WorkerEvent]
+
+
+@dataclass(frozen=True)
+class IdleBackoffPolicy:
+    initial_delay_seconds: float = 0.25
+    multiplier: float = 2.0
+    max_delay_seconds: float = 5.0
+    operational_ceiling_seconds: float = 300.0
+
+
+def compute_idle_backoff_delay_seconds(
+    idle_attempt: int,
+    *,
+    policy: IdleBackoffPolicy = IdleBackoffPolicy(),
+    retry_after_seconds: float | None = None,
+    random_fn: Callable[[], float] = random,
+) -> float:
+    """Computes full-jitter exponential backoff for idle queue polls."""
+    if idle_attempt <= 0:
+        raise ValueError("idle_attempt must be >= 1")
+    if policy.initial_delay_seconds <= 0:
+        raise ValueError("initial_delay_seconds must be > 0")
+    if policy.multiplier < 1:
+        raise ValueError("multiplier must be >= 1")
+    if policy.max_delay_seconds <= 0:
+        raise ValueError("max_delay_seconds must be > 0")
+    if policy.operational_ceiling_seconds <= 0:
+        raise ValueError("operational_ceiling_seconds must be > 0")
+
+    delay_cap = min(
+        policy.max_delay_seconds,
+        policy.initial_delay_seconds * (policy.multiplier ** (idle_attempt - 1)),
+    )
+    jittered_delay = max(0.0, min(1.0, random_fn())) * delay_cap
+
+    effective_delay = jittered_delay
+    if retry_after_seconds is not None:
+        effective_delay = max(effective_delay, retry_after_seconds)
+
+    return min(effective_delay, policy.operational_ceiling_seconds)
 
 
 class WorkQueueStore:
