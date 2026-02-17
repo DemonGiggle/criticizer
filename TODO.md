@@ -15,7 +15,7 @@ This checklist tracks work still needed to fully align implementation with `spec
 ## Work queue
 
 - [x] Add a periodic sweeper executable/entrypoint (currently functionality exists in store methods, but no daemonized loop/ops wrapper).
-- [ ] Add explicit backoff/jitter strategy examples for idle workers.
+- [x] Add explicit backoff/jitter strategy examples for idle workers.
 - [ ] Add tests for long-running lease renewals under high contention and clock-skew scenarios.
 
 ## Request validation and reconciliation

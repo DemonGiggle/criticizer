@@ -1,8 +1,14 @@
+import pytest
 import sqlite3
 import threading
 import time
 
-from work_queue import WorkQueueStore, WorkerRuntime
+from work_queue import (
+    IdleBackoffPolicy,
+    WorkQueueStore,
+    WorkerRuntime,
+    compute_idle_backoff_delay_seconds,
+)
 
 
 def make_store() -> WorkQueueStore:
@@ -336,3 +342,62 @@ def test_claim_next_reclaims_expired_running_before_capacity_check():
 
     still_queued = store.get_job(queued)
     assert still_queued["status"] == "queued"
+
+
+def test_idle_backoff_uses_full_jitter_and_exponential_cap():
+    policy = IdleBackoffPolicy(initial_delay_seconds=1.0, multiplier=2.0, max_delay_seconds=10.0)
+
+    delay_attempt1 = compute_idle_backoff_delay_seconds(1, policy=policy, random_fn=lambda: 0.5)
+    delay_attempt3 = compute_idle_backoff_delay_seconds(3, policy=policy, random_fn=lambda: 0.5)
+    delay_attempt5 = compute_idle_backoff_delay_seconds(5, policy=policy, random_fn=lambda: 0.5)
+
+    assert delay_attempt1 == 0.5
+    assert delay_attempt3 == 2.0
+    assert delay_attempt5 == 5.0
+
+
+def test_idle_backoff_honors_retry_after_and_operational_ceiling():
+    policy = IdleBackoffPolicy(
+        initial_delay_seconds=1.0,
+        multiplier=2.0,
+        max_delay_seconds=8.0,
+        operational_ceiling_seconds=6.0,
+    )
+
+    delay_with_retry_after = compute_idle_backoff_delay_seconds(
+        2,
+        policy=policy,
+        retry_after_seconds=4.5,
+        random_fn=lambda: 0.25,
+    )
+    delay_clamped = compute_idle_backoff_delay_seconds(
+        10,
+        policy=policy,
+        retry_after_seconds=120.0,
+        random_fn=lambda: 1.0,
+    )
+
+    assert delay_with_retry_after == 4.5
+    assert delay_clamped == 6.0
+
+
+def test_idle_backoff_validates_inputs():
+    policy = IdleBackoffPolicy(initial_delay_seconds=1.0, multiplier=2.0, max_delay_seconds=8.0)
+
+    with pytest.raises(ValueError, match="idle_attempt"):
+        compute_idle_backoff_delay_seconds(0, policy=policy)
+
+    with pytest.raises(ValueError, match="initial_delay_seconds"):
+        compute_idle_backoff_delay_seconds(1, policy=IdleBackoffPolicy(initial_delay_seconds=0.0))
+
+    with pytest.raises(ValueError, match="multiplier"):
+        compute_idle_backoff_delay_seconds(1, policy=IdleBackoffPolicy(multiplier=0.5))
+
+    with pytest.raises(ValueError, match="max_delay_seconds"):
+        compute_idle_backoff_delay_seconds(1, policy=IdleBackoffPolicy(max_delay_seconds=0.0))
+
+    with pytest.raises(ValueError, match="operational_ceiling_seconds"):
+        compute_idle_backoff_delay_seconds(
+            1,
+            policy=IdleBackoffPolicy(operational_ceiling_seconds=0.0),
+        )
