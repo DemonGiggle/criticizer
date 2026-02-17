@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,6 +11,14 @@ REQUIRED_FINDING_FIELDS = {"id", "severity", "category", "title", "file", "line"
 ALLOWED_SEVERITIES = {"critical", "high", "medium", "low", "info"}
 ALLOWED_CATEGORIES = {"correctness", "security", "performance", "reliability", "maintainability", "style", "test"}
 ALLOWED_CONFIDENCE = {"high", "medium", "low"}
+TOP_LEVEL_REQUIRED_FIELDS = {"schema_version", "prompt_version", "findings"}
+TOP_LEVEL_OPTIONAL_FIELDS = {"summary", "meta"}
+TOP_LEVEL_ALLOWED_FIELDS = TOP_LEVEL_REQUIRED_FIELDS | TOP_LEVEL_OPTIONAL_FIELDS
+
+SUPPORTED_SCHEMA_VERSION = "1.0"
+SUPPORTED_PROMPT_VERSION = "1.0.0"
+SCHEMA_VERSION_RE = re.compile(r"^(\d+)\.(\d+)$")
+PROMPT_VERSION_RE = re.compile(r"^(\d+)\.(\d+)(?:\.(\d+))?$")
 
 
 @dataclass(frozen=True)
@@ -47,6 +56,25 @@ class DiagnosticRecorder:
         self.entries.append(entry)
 
 
+def _parse_schema_version(value: Any) -> tuple[int, int] | None:
+    if not isinstance(value, str):
+        return None
+    match = SCHEMA_VERSION_RE.fullmatch(value)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _parse_prompt_version(value: Any) -> tuple[int, int, int] | None:
+    if not isinstance(value, str):
+        return None
+    match = PROMPT_VERSION_RE.fullmatch(value)
+    if not match:
+        return None
+    patch = int(match.group(3)) if match.group(3) is not None else 0
+    return int(match.group(1)), int(match.group(2)), patch
+
+
 def validate_and_reconcile_review_result(
     raw_payload: str,
     *,
@@ -76,6 +104,91 @@ def validate_and_reconcile_review_result(
             field="payload",
             reason="top_level_not_object",
             action="reject",
+        )
+        return ValidationOutcome(review_result={"findings": []}, diagnostics=recorder.entries, rejected=True)
+
+    missing_top_level_fields = sorted(TOP_LEVEL_REQUIRED_FIELDS.difference(parsed))
+    if missing_top_level_fields:
+        recorder.emit(
+            correlation_id=correlation_id,
+            code="missing_required_field",
+            field="payload",
+            reason="missing_required_top_level_field",
+            action="reject",
+            details={"missing": missing_top_level_fields},
+        )
+        return ValidationOutcome(review_result={"findings": []}, diagnostics=recorder.entries, rejected=True)
+
+    unexpected_top_level_fields = sorted(set(parsed).difference(TOP_LEVEL_ALLOWED_FIELDS))
+    if unexpected_top_level_fields:
+        recorder.emit(
+            correlation_id=correlation_id,
+            code="schema_mismatch",
+            field="payload",
+            reason="additional_properties_not_allowed",
+            action="reject",
+            details={"additional_properties": unexpected_top_level_fields},
+        )
+        return ValidationOutcome(review_result={"findings": []}, diagnostics=recorder.entries, rejected=True)
+
+    schema_version = parsed.get("schema_version")
+    parsed_schema_version = _parse_schema_version(schema_version)
+    supported_schema_version = _parse_schema_version(SUPPORTED_SCHEMA_VERSION)
+    if parsed_schema_version is None:
+        recorder.emit(
+            correlation_id=correlation_id,
+            code="schema_mismatch",
+            field="schema_version",
+            reason="invalid_schema_version_format",
+            action="reject",
+            details={"value": schema_version, "expected_pattern": "major.minor"},
+        )
+        return ValidationOutcome(review_result={"findings": []}, diagnostics=recorder.entries, rejected=True)
+
+    if supported_schema_version is None:
+        raise RuntimeError("SUPPORTED_SCHEMA_VERSION must follow major.minor format")
+
+    # Backward-compatibility policy: accept equal or newer minor in the same major line.
+    if (
+        parsed_schema_version[0] != supported_schema_version[0]
+        or parsed_schema_version[1] < supported_schema_version[1]
+    ):
+        recorder.emit(
+            correlation_id=correlation_id,
+            code="incompatible_version",
+            field="schema_version",
+            reason="unsupported_schema_version",
+            action="reject",
+            details={"received": schema_version, "supported": SUPPORTED_SCHEMA_VERSION},
+        )
+        return ValidationOutcome(review_result={"findings": []}, diagnostics=recorder.entries, rejected=True)
+
+    prompt_version = parsed.get("prompt_version")
+    parsed_prompt_version = _parse_prompt_version(prompt_version)
+    supported_prompt_version = _parse_prompt_version(SUPPORTED_PROMPT_VERSION)
+    if parsed_prompt_version is None:
+        recorder.emit(
+            correlation_id=correlation_id,
+            code="schema_mismatch",
+            field="prompt_version",
+            reason="invalid_prompt_version_format",
+            action="reject",
+            details={"value": prompt_version, "expected_pattern": "major.minor[.patch]"},
+        )
+        return ValidationOutcome(review_result={"findings": []}, diagnostics=recorder.entries, rejected=True)
+
+    if supported_prompt_version is None:
+        raise RuntimeError("SUPPORTED_PROMPT_VERSION must follow major.minor[.patch] format")
+
+    # Backward-compatibility policy: allow patch drift within the same major/minor.
+    if parsed_prompt_version[:2] != supported_prompt_version[:2]:
+        recorder.emit(
+            correlation_id=correlation_id,
+            code="incompatible_version",
+            field="prompt_version",
+            reason="unsupported_prompt_version",
+            action="reject",
+            details={"received": prompt_version, "supported": SUPPORTED_PROMPT_VERSION},
         )
         return ValidationOutcome(review_result={"findings": []}, diagnostics=recorder.entries, rejected=True)
 
