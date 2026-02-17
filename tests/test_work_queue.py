@@ -132,6 +132,87 @@ def test_claim_next_is_concurrency_safe_for_single_job(tmp_path):
     assert job["claimed_by"] in {"worker-1", "worker-2"}
 
 
+def test_requeue_expired_running_is_idempotent():
+    store = make_store()
+    expired = store.enqueue("expired", run_at="2000-01-01 00:00:00")
+    active = store.enqueue("active", run_at="2000-01-01 00:00:00")
+
+    store.claim(expired, "worker-expired")
+    store.claim(active, "worker-active")
+    store.conn.execute(
+        """
+        UPDATE work_queue
+        SET lease_expires_at = datetime(now(), '-10 seconds')
+        WHERE id = ?
+        """,
+        (expired,),
+    )
+    store.conn.commit()
+
+    first = store.requeue_expired_running()
+    assert first.ok is True
+    assert first.rows_affected == 1
+
+    expired_job = store.get_job(expired)
+    assert expired_job["status"] == "queued"
+    assert expired_job["claimed_by"] is None
+    assert expired_job["lease_expires_at"] is None
+
+    active_job = store.get_job(active)
+    assert active_job["status"] == "running"
+    assert active_job["claimed_by"] == "worker-active"
+
+    second = store.requeue_expired_running()
+    assert second.ok is True
+    assert second.rows_affected == 0
+
+
+def test_requeue_and_claim_next_are_concurrency_safe(tmp_path):
+    db_path = tmp_path / "queue-requeue.db"
+    conn1 = sqlite3.connect(db_path, timeout=5, check_same_thread=False)
+    conn2 = sqlite3.connect(db_path, timeout=5, check_same_thread=False)
+    store1 = WorkQueueStore(conn1)
+    store2 = WorkQueueStore(conn2)
+    job_id = store1.enqueue("expired-shared", run_at="2000-01-01 00:00:00")
+    store1.claim(job_id, "owner")
+    store1.conn.execute(
+        """
+        UPDATE work_queue
+        SET lease_expires_at = datetime(now(), '-30 seconds')
+        WHERE id = ?
+        """,
+        (job_id,),
+    )
+    store1.conn.commit()
+
+    barrier = threading.Barrier(2)
+    results: dict[str, object] = {}
+
+    def sweeper() -> None:
+        barrier.wait()
+        results["requeue"] = store1.requeue_expired_running().rows_affected
+
+    def claimer() -> None:
+        barrier.wait()
+        row = store2.claim_next("claimer", lease_duration_seconds=20)
+        results["claim_id"] = row["id"] if row else None
+
+    t1 = threading.Thread(target=sweeper)
+    t2 = threading.Thread(target=claimer)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert results["requeue"] in {0, 1}
+    assert results["claim_id"] == job_id
+
+    job = store1.get_job(job_id)
+    assert job["status"] == "running"
+    assert job["claimed_by"] == "claimer"
+
+
+
 def test_runtime_periodically_renews_lease_while_processing():
     store = make_store()
     job_id = store.enqueue("heartbeat-job")
